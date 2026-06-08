@@ -1,6 +1,7 @@
-import { SchemaMetadata, TableMetadata } from '../introspection';
+import { SchemaMetadata, TableMetadata, MetadataStore } from '../introspection';
 import { Config } from '../config';
 import { pgTypeToJsonSchema } from './type-map';
+import { getVisibleTablesForRole, getVisibleColumnsForRole } from '../utils/column-filter';
 
 interface OpenAPISpec {
   openapi: string;
@@ -27,12 +28,28 @@ export class OpenAPIGenerator {
 
     for (const [, table] of metadata.tables) {
       this.generateSchemas(table);
-      this.generatePaths(table, metadata);
+      this.generatePaths(table, metadata, this.spec);
     }
   }
 
-  getSpec(): OpenAPISpec {
-    return this.spec;
+  getSpec(metadataStore?: MetadataStore, role?: string): OpenAPISpec {
+    if (!metadataStore || !role) return this.spec;
+
+    const filtered = this.createBaseSpec();
+    filtered.components.schemas = this.baseSchemas();
+    filtered.paths = {};
+    this.addHealthPath(filtered);
+
+    const visibleTables = getVisibleTablesForRole(metadataStore, role);
+    const metadata = metadataStore.get();
+
+    for (const table of visibleTables) {
+      const visibleCols = getVisibleColumnsForRole(table, metadataStore, role);
+      this.generateFilteredSchemas(filtered, table, visibleCols);
+      this.generatePaths(table, metadata, filtered);
+    }
+
+    return filtered;
   }
 
   private createBaseSpec(): OpenAPISpec {
@@ -116,8 +133,9 @@ export class OpenAPIGenerator {
     };
   }
 
-  private addHealthPath(): void {
-    this.spec.paths['/_health'] = {
+  private addHealthPath(spec?: OpenAPISpec): void {
+    const target = spec || this.spec;
+    target.paths['/_health'] = {
       get: {
         summary: 'Health check',
         tags: ['System'],
@@ -185,7 +203,50 @@ export class OpenAPIGenerator {
     }
   }
 
-  private generatePaths(table: TableMetadata, metadata: SchemaMetadata): void {
+  private generateFilteredSchemas(spec: OpenAPISpec, table: TableMetadata, visibleColumns: string[]): void {
+    const responseName = this.schemaName(table.name, 'Response');
+    const createName = this.schemaName(table.name, 'Create');
+    const updateName = this.schemaName(table.name, 'Update');
+
+    const visibleSet = new Set(visibleColumns);
+    const responseProps: Record<string, unknown> = {};
+    const createProps: Record<string, unknown> = {};
+    const updateProps: Record<string, unknown> = {};
+    const createRequired: string[] = [];
+
+    for (const col of table.columns) {
+      if (!visibleSet.has(col.name)) continue;
+      const schema = pgTypeToJsonSchema(col);
+      responseProps[col.name] = schema;
+
+      const isPk = table.primaryKey?.columns.includes(col.name);
+      const isSerial = col.hasDefault && col.defaultValue?.includes('nextval');
+      const isGenerated = col.isGenerated;
+
+      if (!isPk || (!isSerial && !isGenerated)) {
+        if (!isGenerated) {
+          createProps[col.name] = schema;
+          updateProps[col.name] = schema;
+          if (!col.isNullable && !col.hasDefault && !isPk) {
+            createRequired.push(col.name);
+          }
+        }
+      }
+    }
+
+    spec.components.schemas[responseName] = { type: 'object', properties: responseProps };
+
+    if (table.relKind === 'table') {
+      spec.components.schemas[createName] = {
+        type: 'object',
+        properties: createProps,
+        ...(createRequired.length > 0 ? { required: createRequired } : {}),
+      };
+      spec.components.schemas[updateName] = { type: 'object', properties: updateProps };
+    }
+  }
+
+  private generatePaths(table: TableMetadata, metadata: SchemaMetadata, spec: OpenAPISpec): void {
     const isReadOnly = table.relKind === 'view' || table.relKind === 'matview';
     const hasId = !!table.primaryKey;
     const basePath = `/${table.name}`;
@@ -298,7 +359,7 @@ export class OpenAPIGenerator {
       };
     }
 
-    this.spec.paths[basePath] = listOp;
+    spec.paths[basePath] = listOp;
 
     if (hasId) {
       const detailPath: any = {
@@ -379,7 +440,7 @@ export class OpenAPIGenerator {
         };
       }
 
-      this.spec.paths[`${basePath}/{id}`] = detailPath;
+      spec.paths[`${basePath}/{id}`] = detailPath;
     }
 
     if (!isReadOnly && hasId) {
@@ -392,7 +453,7 @@ export class OpenAPIGenerator {
         const childCreateName = this.schemaName(childTable.name, 'Create');
         const nestedPath = `${basePath}/{${table.name}Id}/${childTable.name}`;
 
-        this.spec.paths[nestedPath] = {
+        spec.paths[nestedPath] = {
           get: {
             summary: `List ${childTable.name} for ${table.name}`,
             tags: [table.name, childTable.name],

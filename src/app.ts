@@ -13,6 +13,7 @@ import { createRateLimiter } from './middleware/rate-limiter';
 import { inputValidator } from './middleware/input-validator';
 import { SchemaScheduler } from './utils/scheduler';
 import { createHealthHandler } from './router/handlers/health';
+import { getVisibleTablesForRole, getVisibleColumnsForRole } from './utils/column-filter';
 import logger from './logger';
 
 interface AppDeps {
@@ -56,8 +57,9 @@ export function createApp(deps: AppDeps): express.Application {
   app.use(createRateLimiter(config.rateLimit));
   app.use(inputValidator);
 
-  app.get('/docs/openapi.json', (_req: Request, res: Response) => {
-    res.json(openapiGenerator.getSpec());
+  app.get('/docs/openapi.json', (req: Request, res: Response) => {
+    const role = req.dbRole;
+    res.json(openapiGenerator.getSpec(metadataStore, role));
   });
 
   app.use('/docs', swaggerUi.serve, swaggerUi.setup(undefined, {
@@ -77,13 +79,14 @@ export function createApp(deps: AppDeps): express.Application {
     }
   });
 
-  app.get('/_meta', (_req: Request, res: Response) => {
-    const metadata = metadataStore.get();
-    const tables = [...metadata.tables.values()].map(t => ({
+  app.get('/_meta', (req: Request, res: Response) => {
+    const role = req.dbRole;
+    const visibleTables = getVisibleTablesForRole(metadataStore, role);
+    const tables = visibleTables.map(t => ({
       schema: t.schema,
       name: t.name,
       relKind: t.relKind,
-      columns: t.columns.length,
+      columns: getVisibleColumnsForRole(t, metadataStore, role),
       primaryKey: t.primaryKey?.columns,
       foreignKeys: t.foreignKeys.map(fk => ({
         columns: fk.columns,
@@ -91,7 +94,7 @@ export function createApp(deps: AppDeps): express.Application {
       })),
       hasVersionColumn: t.hasVersionColumn,
     }));
-    res.json({ tables, lastRefreshed: metadata.lastRefreshed });
+    res.json({ tables, lastRefreshed: metadataStore.get().lastRefreshed });
   });
 
   app.use(dynamicRouter.handler());

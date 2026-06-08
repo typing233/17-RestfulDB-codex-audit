@@ -8,6 +8,7 @@ import { AuditLogger } from '../../audit/audit-logger';
 import { NotFoundError, ConflictError } from '../../errors';
 import { Config } from '../../config';
 import { quote } from '../../utils/naming';
+import { parseIfMatch } from '../../utils/etag';
 
 export function createDeleteHandler(
   table: TableMetadata,
@@ -21,8 +22,8 @@ export function createDeleteHandler(
     const pkCol = table.primaryKey?.columns[0] || 'id';
 
     let versionCheck: number | undefined;
-    if (table.hasVersionColumn && req.headers['if-match']) {
-      versionCheck = Number(req.headers['if-match']);
+    if (table.hasVersionColumn) {
+      versionCheck = parseIfMatch(req.headers['if-match'] as string | undefined);
     }
 
     const result = await executeInTransaction(pool, txCtxFromRequest(req), async (client) => {

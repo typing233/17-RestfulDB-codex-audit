@@ -9,6 +9,7 @@ import { AuditLogger } from '../../audit/audit-logger';
 import { NotFoundError } from '../../errors';
 import { Config } from '../../config';
 import { quote } from '../../utils/naming';
+import { formatETag, parseIfMatch } from '../../utils/etag';
 
 export function createUpdateHandler(
   table: TableMetadata,
@@ -27,8 +28,8 @@ export function createUpdateHandler(
     if (table.hasVersionColumn) {
       if (body.version !== undefined) {
         versionCheck = Number(body.version);
-      } else if (req.headers['if-match']) {
-        versionCheck = Number(req.headers['if-match']);
+      } else {
+        versionCheck = parseIfMatch(req.headers['if-match'] as string | undefined);
       }
     }
 
@@ -66,7 +67,7 @@ export function createUpdateHandler(
     });
 
     if (table.hasVersionColumn && result.version !== undefined) {
-      res.set('ETag', String(result.version));
+      res.set('ETag', formatETag(result.version));
     }
 
     res.json(result);

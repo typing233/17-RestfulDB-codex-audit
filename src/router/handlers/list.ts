@@ -11,6 +11,7 @@ import { executeInTransaction, TransactionContext } from '../../transaction';
 import { txCtxFromRequest } from '../../utils/tx-context';
 import { Config } from '../../config';
 import { quote } from '../../utils/naming';
+import { filterRowsColumns, getVisibleColumnsForRole } from '../../utils/column-filter';
 
 export function createListHandler(
   table: TableMetadata,
@@ -22,7 +23,11 @@ export function createListHandler(
   return async (req: Request, res: Response) => {
     const query = req.query as Record<string, string>;
     const filters = parseFilters(query, table);
-    const columns = parseSelect(query.select, table);
+    const userColumns = parseSelect(query.select, table);
+    const visibleColumns = getVisibleColumnsForRole(table, metadataStore, req.dbRole);
+    const columns = userColumns
+      ? userColumns.filter(c => visibleColumns.includes(c))
+      : visibleColumns;
     const rawOrder = parseOrder(query.order, table);
     const order = ensureStableSort(rawOrder, table);
     const pagination = parsePagination(query, config.pagination);
@@ -97,31 +102,56 @@ export function createListHandler(
 
     const { rows, total } = result;
 
-    const rangeStart = isCursorMode ? 0 : pagination.offset;
-    const rangeEnd = rangeStart + rows.length - 1;
-
     res.set('X-Total-Count', String(total));
-    res.set('Content-Range', rows.length > 0
-      ? `items ${rangeStart}-${rangeEnd}/${total}`
-      : `items */${total}`);
     res.set('Preference-Applied', `count=${countStrategy}`);
+
+    if (isCursorMode) {
+      res.set('Content-Range', rows.length > 0
+        ? `items */${total}`
+        : `items */${total}`);
+    } else {
+      const rangeStart = pagination.offset;
+      const rangeEnd = rangeStart + rows.length - 1;
+      res.set('Content-Range', rows.length > 0
+        ? `items ${rangeStart}-${rangeEnd}/${total}`
+        : `items */${total}`);
+    }
 
     if (rows.length > 0) {
       const cursorCols = getCursorColumns(order);
       const links: string[] = [];
 
-      const lastRow = rows[rows.length - 1];
-      const nextCursor = encodeCursor(lastRow, cursorCols);
-      links.push(`<${req.path}?after=${encodeURIComponent(nextCursor)}&limit=${pagination.limit}>; rel="next"`);
+      const preservedParams = new URLSearchParams();
+      for (const [key, val] of Object.entries(query)) {
+        if (key === 'after' || key === 'before' || key === 'offset') continue;
+        preservedParams.set(key, val);
+      }
 
-      const firstRow = rows[0];
-      const prevCursor = encodeCursor(firstRow, cursorCols);
-      links.push(`<${req.path}?before=${encodeURIComponent(prevCursor)}&limit=${pagination.limit}>; rel="prev"`);
+      if (rows.length >= pagination.limit) {
+        const lastRow = rows[rows.length - 1];
+        const nextCursor = encodeCursor(lastRow, cursorCols);
+        const nextParams = new URLSearchParams(preservedParams);
+        nextParams.set('after', nextCursor);
+        nextParams.set('limit', String(pagination.limit));
+        links.push(`<${req.path}?${nextParams.toString()}>; rel="next"`);
+      }
 
-      res.set('Link', links.join(', '));
+      if (cursor.after || cursor.before) {
+        const firstRow = rows[0];
+        const prevCursor = encodeCursor(firstRow, cursorCols);
+        const prevParams = new URLSearchParams(preservedParams);
+        prevParams.set('before', prevCursor);
+        prevParams.set('limit', String(pagination.limit));
+        links.push(`<${req.path}?${prevParams.toString()}>; rel="prev"`);
+      }
+
+      if (links.length > 0) {
+        res.set('Link', links.join(', '));
+      }
     }
 
-    res.json(rows);
+    const filtered = filterRowsColumns(rows, table, metadataStore, req.dbRole);
+    res.json(filtered);
   };
 }
 
@@ -132,47 +162,120 @@ async function resolveEmbeds(
   parentTable: TableMetadata,
   metadata: SchemaMetadata,
 ): Promise<void> {
-  for (const embed of embeds) {
-    if (embed.isParent) {
-      const fkValues = [...new Set(rows.map(r => r[embed.fkColumn]).filter(v => v != null))];
-      if (fkValues.length === 0) {
-        rows.forEach(r => (r[embed.relation] = null));
-        continue;
-      }
+  if (rows.length === 0) return;
 
-      const overrideSql = `SELECT * FROM ${quote(embed.table.schema)}.${quote(embed.table.name)} WHERE ${quote(embed.parentColumn)} = ANY($1)`;
-      const result = await client.query(overrideSql, [fkValues]);
-      const map = new Map<unknown, Record<string, unknown>>();
-      for (const row of result.rows) {
-        map.set(row[embed.parentColumn], row);
-      }
-      for (const row of rows) {
-        row[embed.relation] = map.get(row[embed.fkColumn]) || null;
-      }
-    } else {
-      const pkCol = parentTable.primaryKey?.columns[0] || 'id';
-      const parentIds = [...new Set(rows.map(r => r[pkCol]).filter(v => v != null))];
-      if (parentIds.length === 0) {
-        rows.forEach(r => (r[embed.relation] = []));
-        continue;
-      }
+  const baseAlias = '_base';
+  const { joinClauses, selectAliases } = buildJoinQueryWithMeta(baseAlias, embeds);
 
-      const sql = `SELECT * FROM ${quote(embed.table.schema)}.${quote(embed.table.name)} WHERE ${quote(embed.fkColumn)} = ANY($1)`;
-      const result = await client.query(sql, [parentIds]);
+  const pkCol = parentTable.primaryKey?.columns[0] || 'id';
+  const parentIds = [...new Set(rows.map(r => r[pkCol]).filter(v => v != null))];
+  if (parentIds.length === 0) return;
 
+  const baseFull = `${quote(parentTable.schema)}.${quote(parentTable.name)}`;
+  const selectParts = [`${baseAlias}.${quote(pkCol)} AS "_base_pk"`];
+
+  let aliasIdx = 0;
+  const embedMeta: { alias: string; embed: EmbedRequest; columns: string[] }[] = [];
+
+  function collectMeta(embedList: EmbedRequest[]) {
+    for (const embed of embedList) {
+      aliasIdx++;
+      const alias = `_e${aliasIdx}`;
+      const cols = embed.table.columns.map(c => c.name);
+      embedMeta.push({ alias, embed, columns: cols });
+      for (const col of cols) {
+        selectParts.push(`${alias}.${quote(col)} AS "${alias}__${col}"`);
+      }
       if (embed.nested && embed.nested.length > 0) {
-        await resolveEmbeds(client, result.rows, embed.nested, embed.table, metadata);
-      }
-
-      const grouped = new Map<unknown, Record<string, unknown>[]>();
-      for (const row of result.rows) {
-        const key = row[embed.fkColumn];
-        if (!grouped.has(key)) grouped.set(key, []);
-        grouped.get(key)!.push(row);
-      }
-      for (const row of rows) {
-        row[embed.relation] = grouped.get(row[pkCol]) || [];
+        collectMeta(embed.nested);
       }
     }
   }
+  collectMeta(embeds);
+
+  const sql = `SELECT ${selectParts.join(', ')} FROM ${baseFull} AS ${baseAlias} ${joinClauses.join(' ')} WHERE ${baseAlias}.${quote(pkCol)} = ANY($1)`;
+  const result = await client.query(sql, [parentIds]);
+
+  const rowMap = new Map<unknown, Record<string, unknown>>();
+  for (const row of rows) {
+    rowMap.set(row[pkCol], row);
+    for (const em of embedMeta) {
+      if (em.embed.isParent) {
+        row[em.embed.relation] = row[em.embed.relation] ?? null;
+      } else {
+        row[em.embed.relation] = row[em.embed.relation] ?? [];
+      }
+    }
+  }
+
+  const childSets = new Map<string, Set<string>>();
+
+  for (const joinRow of result.rows) {
+    const basePk = joinRow['_base_pk'];
+    const parentRow = rowMap.get(basePk);
+    if (!parentRow) continue;
+
+    for (const em of embedMeta) {
+      const keyCol = `${em.alias}__${em.embed.table.primaryKey?.columns[0] || 'id'}`;
+      const childPk = joinRow[keyCol];
+      if (childPk == null) continue;
+
+      const childObj: Record<string, unknown> = {};
+      for (const col of em.columns) {
+        childObj[col] = joinRow[`${em.alias}__${col}`];
+      }
+
+      if (em.embed.isParent) {
+        parentRow[em.embed.relation] = childObj;
+      } else {
+        const dedupeKey = `${basePk}:${em.alias}:${childPk}`;
+        if (!childSets.has(dedupeKey)) {
+          childSets.set(dedupeKey, new Set());
+          (parentRow[em.embed.relation] as Record<string, unknown>[]).push(childObj);
+        }
+      }
+    }
+  }
+}
+
+function buildJoinQueryWithMeta(
+  baseAlias: string,
+  embeds: EmbedRequest[],
+): { joinClauses: string[]; selectAliases: string[] } {
+  const joinClauses: string[] = [];
+  const selectAliases: string[] = [];
+  let aliasIdx = 0;
+
+  function traverse(parentAlias: string, embedList: EmbedRequest[]) {
+    for (const embed of embedList) {
+      aliasIdx++;
+      const alias = `_e${aliasIdx}`;
+      const targetFull = `${quote(embed.table.schema)}.${quote(embed.table.name)}`;
+
+      const joinConditions: string[] = [];
+      for (let i = 0; i < embed.fkColumns.length; i++) {
+        if (embed.isParent) {
+          joinConditions.push(
+            `${parentAlias}.${quote(embed.fkColumns[i])} = ${alias}.${quote(embed.parentColumns[i])}`
+          );
+        } else {
+          joinConditions.push(
+            `${parentAlias}.${quote(embed.parentColumns[i])} = ${alias}.${quote(embed.fkColumns[i])}`
+          );
+        }
+      }
+
+      joinClauses.push(
+        `LEFT JOIN ${targetFull} AS ${alias} ON ${joinConditions.join(' AND ')}`
+      );
+      selectAliases.push(alias);
+
+      if (embed.nested && embed.nested.length > 0) {
+        traverse(alias, embed.nested);
+      }
+    }
+  }
+
+  traverse(baseAlias, embeds);
+  return { joinClauses, selectAliases };
 }

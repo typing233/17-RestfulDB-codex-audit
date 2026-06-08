@@ -16,6 +16,9 @@ BEGIN
 END $$;
 
 GRANT USAGE ON SCHEMA public TO anon, authenticated, admin;
+GRANT anon TO postgres;
+GRANT authenticated TO postgres;
+GRANT admin TO postgres;
 
 -- Tables
 CREATE TABLE IF NOT EXISTS users (
@@ -78,7 +81,9 @@ CREATE TABLE IF NOT EXISTS reviews (
 GRANT ALL ON ALL TABLES IN SCHEMA public TO admin;
 GRANT ALL ON ALL SEQUENCES IN SCHEMA public TO admin;
 
-GRANT SELECT ON ALL TABLES IN SCHEMA public TO anon;
+-- Anon: SELECT on all tables but restricted columns on users
+GRANT SELECT ON categories, products, orders, order_items, reviews TO anon;
+GRANT SELECT (id, name, role, created_at, version) ON users TO anon;
 
 GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO authenticated;
 GRANT USAGE ON ALL SEQUENCES IN SCHEMA public TO authenticated;

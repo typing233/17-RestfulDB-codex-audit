@@ -91,7 +91,9 @@ export class MetadataStore {
   }
 
   getAccessibleColumns(table: TableMetadata, role: string, privilege: 'SELECT' | 'INSERT' | 'UPDATE'): string[] {
-    if (table.columnPrivileges.length === 0) {
+    const privLower = privilege.toLowerCase() as 'select' | 'insert' | 'update';
+
+    if (table.privileges[privLower].has(role)) {
       return table.columns.map(c => c.name);
     }
 
@@ -99,15 +101,29 @@ export class MetadataStore {
       cp => cp.grantee === role && cp.privilegeType === privilege
     );
 
-    if (rolePrivileges.length === 0) {
+    if (rolePrivileges.length > 0) {
+      return rolePrivileges.map(cp => cp.column);
+    }
+
+    if (table.privileges[privLower].size === 0 && table.columnPrivileges.length === 0) {
       return table.columns.map(c => c.name);
     }
 
-    return rolePrivileges.map(cp => cp.column);
+    return [];
   }
 
   hasTablePrivilege(table: TableMetadata, role: string, privilege: 'select' | 'insert' | 'update' | 'delete'): boolean {
-    if (table.privileges[privilege].size === 0) return true;
-    return table.privileges[privilege].has(role);
+    if (table.privileges[privilege].size === 0 && table.columnPrivileges.length === 0) return true;
+    if (table.privileges[privilege].has(role)) return true;
+
+    const privUpper = privilege.toUpperCase() as 'SELECT' | 'INSERT' | 'UPDATE';
+    if (privilege !== 'delete') {
+      const hasColumnPriv = table.columnPrivileges.some(
+        cp => cp.grantee === role && cp.privilegeType === privUpper
+      );
+      if (hasColumnPriv) return true;
+    }
+
+    return false;
   }
 }

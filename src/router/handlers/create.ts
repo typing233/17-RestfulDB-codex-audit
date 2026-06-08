@@ -7,6 +7,7 @@ import { txCtxFromRequest } from '../../utils/tx-context';
 import { AuditLogger } from '../../audit/audit-logger';
 import { createBulkCreateHandler } from './bulk';
 import { Config } from '../../config';
+import { formatETag } from '../../utils/etag';
 
 export function createCreateHandler(
   table: TableMetadata,
@@ -51,7 +52,7 @@ export function createCreateHandler(
     });
 
     if (table.hasVersionColumn && result.version !== undefined) {
-      res.set('ETag', String(result.version));
+      res.set('ETag', formatETag(result.version));
     }
 
     res.status(201).json(result);

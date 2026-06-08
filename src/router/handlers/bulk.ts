@@ -9,6 +9,7 @@ import { AuditLogger } from '../../audit/audit-logger';
 import { ValidationError, ConflictError } from '../../errors';
 import { Config } from '../../config';
 import { quote } from '../../utils/naming';
+import { formatETag, parseIfMatch } from '../../utils/etag';
 
 export function createBulkCreateHandler(
   table: TableMetadata,
@@ -95,38 +96,36 @@ export function createBulkUpdateHandler(
       throw new ValidationError('Bulk update body must be an object with fields to update');
     }
 
-    let versionCheck: number | undefined;
-    if (table.hasVersionColumn && req.headers['if-match']) {
-      versionCheck = Number(req.headers['if-match']);
-    }
+    const versionCheck = table.hasVersionColumn
+      ? parseIfMatch(req.headers['if-match'] as string | undefined)
+      : undefined;
 
     const result = await executeInTransaction(pool, txCtxFromRequest(req), async (client) => {
       const qb = new QueryBuilder(table);
+      const pkCol = table.primaryKey?.columns[0] || 'id';
 
       let oldRows: Record<string, unknown>[] = [];
-      if (audit.enabled) {
+      if (audit.enabled || versionCheck !== undefined) {
         const selectQ = qb.buildSelect({ filters });
         const oldResult = await client.query(selectQ.sql, selectQ.params);
         oldRows = oldResult.rows;
       }
 
-      const effectiveFilters = [...filters];
-      if (versionCheck !== undefined) {
-        effectiveFilters.push({ column: 'version', operator: '=', value: versionCheck });
+      if (versionCheck !== undefined && oldRows.length > 0) {
+        const mismatch = oldRows.find(r => Number(r.version) !== versionCheck);
+        if (mismatch) {
+          throw new ConflictError(
+            `Version conflict: record ${mismatch[pkCol]} has version ${mismatch.version}, expected ${versionCheck}`
+          );
+        }
       }
 
-      const { sql, params } = qb.buildBulkUpdate(data, effectiveFilters);
+      const { sql, params } = qb.buildBulkUpdate(data, filters);
       if (!sql) throw new ValidationError('No valid columns to update');
       const dbResult = await client.query(sql, params);
-
-      if (versionCheck !== undefined && dbResult.rowCount === 0 && oldRows.length > 0) {
-        throw new ConflictError('Version conflict: one or more records have been modified');
-      }
-
       const results = dbResult.rows;
 
       if (audit.enabled) {
-        const pkCol = table.primaryKey?.columns[0] || 'id';
         const oldMap = new Map(oldRows.map(r => [String(r[pkCol]), r]));
         for (const record of results) {
           await audit.log(client, {
@@ -146,7 +145,7 @@ export function createBulkUpdateHandler(
     });
 
     if (table.hasVersionColumn && result.length > 0 && result[0].version !== undefined) {
-      res.set('ETag', String(result[0].version));
+      res.set('ETag', formatETag(result[0].version));
     }
 
     res.json(result);
@@ -168,34 +167,30 @@ export function createBulkDeleteHandler(
       throw new ValidationError('Bulk delete requires at least one filter to prevent accidental full-table deletes');
     }
 
-    let versionCheck: number | undefined;
-    if (table.hasVersionColumn && req.headers['if-match']) {
-      versionCheck = Number(req.headers['if-match']);
-    }
+    const versionCheck = table.hasVersionColumn
+      ? parseIfMatch(req.headers['if-match'] as string | undefined)
+      : undefined;
 
     const result = await executeInTransaction(pool, txCtxFromRequest(req), async (client) => {
       const qb = new QueryBuilder(table);
+      const pkCol = table.primaryKey?.columns[0] || 'id';
 
-      const effectiveFilters = [...filters];
       if (versionCheck !== undefined) {
-        effectiveFilters.push({ column: 'version', operator: '=', value: versionCheck });
-      }
-
-      const { sql, params } = qb.buildBulkDelete(effectiveFilters);
-      const dbResult = await client.query(sql, params);
-
-      if (versionCheck !== undefined && dbResult.rowCount === 0) {
-        const checkQ = qb.buildCount({ filters });
-        const checkR = await client.query(checkQ.sql, checkQ.params);
-        if (parseInt(checkR.rows[0].total, 10) > 0) {
-          throw new ConflictError('Version conflict: one or more records have been modified');
+        const selectQ = qb.buildSelect({ filters });
+        const existingResult = await client.query(selectQ.sql, selectQ.params);
+        const mismatch = existingResult.rows.find(r => Number(r.version) !== versionCheck);
+        if (mismatch) {
+          throw new ConflictError(
+            `Version conflict: record ${mismatch[pkCol]} has version ${mismatch.version}, expected ${versionCheck}`
+          );
         }
       }
 
+      const { sql, params } = qb.buildBulkDelete(filters);
+      const dbResult = await client.query(sql, params);
       const results = dbResult.rows;
 
       if (audit.enabled) {
-        const pkCol = table.primaryKey?.columns[0] || 'id';
         for (const record of results) {
           await audit.log(client, {
             tableName: table.name,
