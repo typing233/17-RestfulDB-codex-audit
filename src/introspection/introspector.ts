@@ -15,6 +15,19 @@ import {
   UNIQUE_CONSTRAINTS_QUERY,
 } from './queries';
 
+function parsePgArray(val: unknown): string[] {
+  if (Array.isArray(val)) return val;
+  if (typeof val === 'string') {
+    const s = val.trim();
+    if (s.startsWith('{') && s.endsWith('}')) {
+      const inner = s.slice(1, -1);
+      if (inner === '') return [];
+      return inner.split(',').map(v => v.trim().replace(/^"|"$/g, ''));
+    }
+  }
+  return [];
+}
+
 export class Introspector {
   constructor(
     private pool: Pool,
@@ -78,7 +91,7 @@ export class Introspector {
 
       const pk: PrimaryKeyMetadata = {
         constraintName: row.constraint_name,
-        columns: row.columns,
+        columns: parsePgArray(row.columns),
       };
       table.primaryKey = pk;
     }
@@ -90,10 +103,10 @@ export class Introspector {
 
       const fk: ForeignKeyMetadata = {
         constraintName: row.constraint_name,
-        columns: row.columns,
+        columns: parsePgArray(row.columns),
         referencedSchema: row.referenced_schema,
         referencedTable: row.referenced_table,
-        referencedColumns: row.referenced_columns,
+        referencedColumns: parsePgArray(row.referenced_columns),
         onDelete: row.on_delete,
         onUpdate: row.on_update,
       };
@@ -106,8 +119,8 @@ export class Introspector {
           ...fk,
           referencedTable: row.table_name,
           referencedSchema: row.table_schema,
-          referencedColumns: row.columns,
-          columns: row.referenced_columns,
+          referencedColumns: parsePgArray(row.columns),
+          columns: parsePgArray(row.referenced_columns),
         });
       }
     }
@@ -119,7 +132,7 @@ export class Introspector {
 
       const uc: UniqueConstraintMetadata = {
         constraintName: row.constraint_name,
-        columns: row.columns,
+        columns: parsePgArray(row.columns),
       };
       table.uniqueConstraints.push(uc);
     }
