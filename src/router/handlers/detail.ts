@@ -3,6 +3,7 @@ import { Pool } from 'pg';
 import { TableMetadata, MetadataStore } from '../../introspection';
 import { QueryBuilder, parseSelect, parseEmbed } from '../../query-builder';
 import { executeInTransaction } from '../../transaction';
+import { txCtxFromRequest } from '../../utils/tx-context';
 import { NotFoundError } from '../../errors';
 import { Config } from '../../config';
 import { quote } from '../../utils/naming';
@@ -21,7 +22,7 @@ export function createDetailHandler(
     const columns = parseSelect(query.select, table);
     const embeds = parseEmbed(query.embed, table, metadataStore.get());
 
-    const result = await executeInTransaction(pool, req.dbRole, async (client) => {
+    const result = await executeInTransaction(pool, txCtxFromRequest(req), async (client) => {
       const qb = new QueryBuilder(table);
       const selectQuery = qb.buildSelect({
         columns,
@@ -58,6 +59,10 @@ export function createDetailHandler(
 
       return rows[0];
     });
+
+    if (table.hasVersionColumn && result.version !== undefined) {
+      res.set('ETag', String(result.version));
+    }
 
     res.json(result);
   };

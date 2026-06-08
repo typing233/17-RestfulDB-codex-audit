@@ -4,9 +4,11 @@ import { TableMetadata, SchemaMetadata, MetadataStore } from '../../introspectio
 import {
   QueryBuilder, parseFilters, parseSelect, parseOrder, parsePagination,
   parseEmbed, EmbedRequest, parseCountStrategy,
-  parseCursor, decodeCursor, encodeCursor, buildKeysetCondition, ensureStableSort, getCursorColumns,
+  parseCursor, decodeCursor, encodeCursor, buildKeysetCondition,
+  ensureStableSort, getCursorColumns, reverseOrder,
 } from '../../query-builder';
-import { executeInTransaction } from '../../transaction';
+import { executeInTransaction, TransactionContext } from '../../transaction';
+import { txCtxFromRequest } from '../../utils/tx-context';
 import { Config } from '../../config';
 import { quote } from '../../utils/naming';
 
@@ -29,29 +31,35 @@ export function createListHandler(
     const cursor = parseCursor(query);
 
     const extra = extraWhere ? { column: extraWhere.column, value: req.params[extraWhere.paramName] } : undefined;
+    const txCtx = txCtxFromRequest(req);
+    const isCursorMode = !!(cursor.after || cursor.before);
+    const isBackward = !!cursor.before;
 
-    const result = await executeInTransaction(pool, req.dbRole, async (client) => {
+    const result = await executeInTransaction(pool, txCtx, async (client) => {
       const qb = new QueryBuilder(table);
 
       let keysetCondition: { sql: string; params: unknown[] } | undefined;
+      let effectiveOrder = order;
+
       if (cursor.after) {
         const decoded = decodeCursor(cursor.after);
         if (decoded) {
-          keysetCondition = buildKeysetCondition(decoded, order, 'forward', 0);
+          keysetCondition = buildKeysetCondition(decoded, order, 'forward');
         }
       } else if (cursor.before) {
         const decoded = decodeCursor(cursor.before);
         if (decoded) {
-          keysetCondition = buildKeysetCondition(decoded, order, 'backward', 0);
+          keysetCondition = buildKeysetCondition(decoded, order, 'backward');
+          effectiveOrder = reverseOrder(order);
         }
       }
 
       const selectQuery = qb.buildSelect({
         columns,
         filters,
-        order,
+        order: effectiveOrder,
         limit: pagination.limit,
-        offset: cursor.after || cursor.before ? undefined : pagination.offset,
+        offset: isCursorMode ? undefined : pagination.offset,
         extraWhere: extra,
         keysetCondition,
       });
@@ -61,12 +69,12 @@ export function createListHandler(
       if (countStrategy === 'estimated') {
         const estQuery = qb.buildEstimateCount();
         const estResult = await client.query(estQuery.sql, estQuery.params);
-        total = parseInt(estResult.rows[0]?.total ?? '0', 10);
+        total = Math.max(0, parseInt(estResult.rows[0]?.total ?? '0', 10));
       } else if (countStrategy === 'planned') {
         const planQuery = qb.buildPlannedCount({ filters, extraWhere: extra });
         const planResult = await client.query(planQuery.sql, planQuery.params);
         const plan = planResult.rows[0]?.['QUERY PLAN'];
-        total = Array.isArray(plan) ? (plan[0]?.Plan?.['Plan Rows'] ?? 0) : 0;
+        total = Array.isArray(plan) ? Math.round(plan[0]?.Plan?.['Plan Rows'] ?? 0) : 0;
       } else {
         const countQuery = qb.buildCount({ filters, extraWhere: extra });
         const countResult = await client.query(countQuery.sql, countQuery.params);
@@ -74,7 +82,11 @@ export function createListHandler(
       }
 
       const dataResult = await client.query(selectQuery.sql, selectQuery.params);
-      const rows = dataResult.rows;
+      let rows = dataResult.rows;
+
+      if (isBackward) {
+        rows = rows.reverse();
+      }
 
       if (embeds.length > 0) {
         await resolveEmbeds(client, rows, embeds, table, metadataStore.get());
@@ -84,25 +96,27 @@ export function createListHandler(
     });
 
     const { rows, total } = result;
-    const start = pagination.offset;
-    const end = Math.min(start + rows.length - 1, total - 1);
+
+    const rangeStart = isCursorMode ? 0 : pagination.offset;
+    const rangeEnd = rangeStart + rows.length - 1;
 
     res.set('X-Total-Count', String(total));
-    res.set('Content-Range', `items ${start}-${end >= 0 ? end : 0}/${total}`);
+    res.set('Content-Range', rows.length > 0
+      ? `items ${rangeStart}-${rangeEnd}/${total}`
+      : `items */${total}`);
     res.set('Preference-Applied', `count=${countStrategy}`);
 
     if (rows.length > 0) {
       const cursorCols = getCursorColumns(order);
       const links: string[] = [];
+
       const lastRow = rows[rows.length - 1];
       const nextCursor = encodeCursor(lastRow, cursorCols);
-      links.push(`<${req.path}?after=${nextCursor}&limit=${pagination.limit}>; rel="next"`);
+      links.push(`<${req.path}?after=${encodeURIComponent(nextCursor)}&limit=${pagination.limit}>; rel="next"`);
 
-      if (rows.length > 0) {
-        const firstRow = rows[0];
-        const prevCursor = encodeCursor(firstRow, cursorCols);
-        links.push(`<${req.path}?before=${prevCursor}&limit=${pagination.limit}>; rel="prev"`);
-      }
+      const firstRow = rows[0];
+      const prevCursor = encodeCursor(firstRow, cursorCols);
+      links.push(`<${req.path}?before=${encodeURIComponent(prevCursor)}&limit=${pagination.limit}>; rel="prev"`);
 
       res.set('Link', links.join(', '));
     }

@@ -77,10 +77,12 @@ export class QueryBuilder {
     }
 
     if (opts.keysetCondition && opts.keysetCondition.sql) {
-      const reindexed = opts.keysetCondition.sql.replace(/\$(\d+)/g, () => {
-        paramIdx++;
-        return `$${paramIdx}`;
+      let idxCounter = 0;
+      const reindexed = opts.keysetCondition.sql.replace(/\$IDX(\d+)/g, () => {
+        idxCounter++;
+        return `$${paramIdx + idxCounter}`;
       });
+      paramIdx += opts.keysetCondition.params.length;
       whereClauses.push(reindexed);
       params.push(...opts.keysetCondition.params);
     }
@@ -367,5 +369,5 @@ export { parseFilters, FilterCondition } from './filter-parser';
 export { parseSelect } from './select-parser';
 export { parseOrder, OrderClause } from './order-parser';
 export { parsePagination, PaginationParams, parseCountStrategy, CountStrategy } from './pagination';
-export { parseEmbed, EmbedRequest } from './embed-resolver';
-export { parseCursor, decodeCursor, encodeCursor, buildKeysetCondition, ensureStableSort, getCursorColumns, CursorParams } from './cursor-pagination';
+export { parseEmbed, EmbedRequest, buildJoinQuery } from './embed-resolver';
+export { parseCursor, decodeCursor, encodeCursor, buildKeysetCondition, ensureStableSort, getCursorColumns, reverseOrder, CursorParams } from './cursor-pagination';

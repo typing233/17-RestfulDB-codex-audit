@@ -9,10 +9,16 @@ RUN npm run build
 FROM node:20-alpine
 WORKDIR /app
 RUN addgroup -g 1001 -S nodejs && adduser -S restfuldb -u 1001
+
 COPY --from=builder /app/dist ./dist
 COPY --from=builder /app/node_modules ./node_modules
 COPY package.json ./
+
+# Copy migration scripts (these exist in repo root, not in builder)
 COPY scripts/ ./scripts/
+
+RUN chown -R restfuldb:nodejs /app
+
 USER restfuldb
 EXPOSE 3000
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \

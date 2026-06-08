@@ -7,12 +7,6 @@ export interface CursorParams {
   before?: string;
 }
 
-interface CursorValue {
-  columns: string[];
-  values: unknown[];
-  direction: 'forward' | 'backward';
-}
-
 export function parseCursor(query: { after?: string; before?: string }): CursorParams {
   return { after: query.after, before: query.before };
 }
@@ -38,37 +32,53 @@ export function buildKeysetCondition(
   cursor: Record<string, unknown>,
   order: OrderClause[],
   direction: 'forward' | 'backward',
-  startParamIdx: number,
 ): { sql: string; params: unknown[] } {
+  const relevantOrder = order.filter(o => cursor[o.column] !== undefined);
+  if (relevantOrder.length === 0) return { sql: '', params: [] };
+
   const params: unknown[] = [];
-  const columns: string[] = [];
-  const placeholders: string[] = [];
 
-  for (const o of order) {
-    const val = cursor[o.column];
-    if (val === undefined) continue;
-    columns.push(quote(o.column));
-    params.push(val);
-    placeholders.push(`$${startParamIdx + params.length - 1 + 1}`);
+  if (relevantOrder.length === 1) {
+    const o = relevantOrder[0];
+    const op = getOperator(o.direction, direction);
+    params.push(cursor[o.column]);
+    return { sql: `${quote(o.column)} ${op} $IDX1`, params };
   }
 
-  if (columns.length === 0) return { sql: '', params: [] };
+  // Multi-column keyset: use SQL row-value comparison with proper ordering
+  // For mixed directions we use the expanded OR form:
+  // (a > v1) OR (a = v1 AND b < v2) OR (a = v1 AND b = v2 AND c > v3) ...
+  const clauses: string[] = [];
 
-  const ops = order.map(o => {
-    const isAsc = o.direction === 'ASC';
-    if (direction === 'forward') return isAsc ? '>' : '<';
-    return isAsc ? '<' : '>';
-  });
-
-  if (columns.length === 1) {
-    return {
-      sql: `${columns[0]} ${ops[0]} $${startParamIdx + 1}`,
-      params,
-    };
+  for (let depth = 0; depth < relevantOrder.length; depth++) {
+    const parts: string[] = [];
+    for (let i = 0; i < depth; i++) {
+      const o = relevantOrder[i];
+      params.push(cursor[o.column]);
+      parts.push(`${quote(o.column)} = $IDX${params.length}`);
+    }
+    const o = relevantOrder[depth];
+    const op = getOperator(o.direction, direction);
+    params.push(cursor[o.column]);
+    parts.push(`${quote(o.column)} ${op} $IDX${params.length}`);
+    clauses.push(`(${parts.join(' AND ')})`);
   }
 
-  const sql = `(${columns.join(', ')}) ${ops[0] === '>' ? '>' : '<'} (${placeholders.join(', ')})`;
-  return { sql, params };
+  return { sql: `(${clauses.join(' OR ')})`, params };
+}
+
+function getOperator(sortDir: 'ASC' | 'DESC', cursorDir: 'forward' | 'backward'): string {
+  if (cursorDir === 'forward') {
+    return sortDir === 'ASC' ? '>' : '<';
+  }
+  return sortDir === 'ASC' ? '<' : '>';
+}
+
+export function reverseOrder(order: OrderClause[]): OrderClause[] {
+  return order.map(o => ({
+    column: o.column,
+    direction: o.direction === 'ASC' ? 'DESC' : 'ASC',
+  }));
 }
 
 export function ensureStableSort(order: OrderClause[], table: TableMetadata): OrderClause[] {

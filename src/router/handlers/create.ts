@@ -3,6 +3,7 @@ import { Pool } from 'pg';
 import { TableMetadata, MetadataStore } from '../../introspection';
 import { NestedWriter } from '../../transaction/nested-writer';
 import { executeInTransaction } from '../../transaction';
+import { txCtxFromRequest } from '../../utils/tx-context';
 import { AuditLogger } from '../../audit/audit-logger';
 import { createBulkCreateHandler } from './bulk';
 import { Config } from '../../config';
@@ -28,7 +29,7 @@ export function createCreateHandler(
       body[prefill.column] = req.params[prefill.paramName];
     }
 
-    const result = await executeInTransaction(pool, req.dbRole, async (client) => {
+    const result = await executeInTransaction(pool, txCtxFromRequest(req), async (client) => {
       const writer = new NestedWriter(metadataStore.get());
       const record = await writer.create(client, table, body);
 

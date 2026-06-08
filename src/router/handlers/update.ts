@@ -2,9 +2,13 @@ import { Request, Response } from 'express';
 import { Pool } from 'pg';
 import { TableMetadata, MetadataStore } from '../../introspection';
 import { NestedWriter } from '../../transaction/nested-writer';
+import { QueryBuilder } from '../../query-builder';
 import { executeInTransaction } from '../../transaction';
+import { txCtxFromRequest } from '../../utils/tx-context';
 import { AuditLogger } from '../../audit/audit-logger';
+import { NotFoundError } from '../../errors';
 import { Config } from '../../config';
+import { quote } from '../../utils/naming';
 
 export function createUpdateHandler(
   table: TableMetadata,
@@ -28,7 +32,20 @@ export function createUpdateHandler(
       }
     }
 
-    const result = await executeInTransaction(pool, req.dbRole, async (client) => {
+    const result = await executeInTransaction(pool, txCtxFromRequest(req), async (client) => {
+      let oldData: Record<string, unknown> | null = null;
+
+      if (audit?.enabled) {
+        const qb = new QueryBuilder(table);
+        const selectQ = qb.buildSelect({
+          filters: [{ column: pkCol, operator: '=', value: id }],
+        });
+        const oldResult = await client.query(selectQ.sql, selectQ.params);
+        if (oldResult.rows.length > 0) {
+          oldData = oldResult.rows[0];
+        }
+      }
+
       const writer = new NestedWriter(metadataStore.get());
       const record = await writer.update(client, table, id, body, versionCheck);
 
@@ -37,7 +54,7 @@ export function createUpdateHandler(
           tableName: table.name,
           recordId: String(id),
           action: 'UPDATE',
-          oldData: null,
+          oldData,
           newData: record,
           changedBy: req.jwtPayload?.sub || null,
           role: req.dbRole || null,
