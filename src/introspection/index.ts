@@ -7,4 +7,7 @@ export type {
   PrimaryKeyMetadata,
   ForeignKeyMetadata,
   UniqueConstraintMetadata,
+  RelKind,
+  ColumnPrivilege,
+  TablePrivileges,
 } from './metadata';

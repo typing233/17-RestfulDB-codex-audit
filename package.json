@@ -4,11 +4,12 @@
   "description": "Automatically expose PostgreSQL databases as RESTful APIs with full CRUD, RLS, and auto-generated Swagger docs",
   "main": "dist/index.js",
   "scripts": {
-    "dev": "tsx watch src/index.ts",
+    "dev": "RESTFULDB_LOG_PRETTY=true tsx watch src/index.ts",
     "build": "tsc",
     "start": "node dist/index.js",
     "lint": "eslint src/ --ext .ts",
-    "test": "jest"
+    "test": "jest",
+    "migrate": "psql $DATABASE_URL -f scripts/migrations/001_audit_log.sql && psql $DATABASE_URL -f scripts/migrations/002_views_example.sql"
   },
   "dependencies": {
     "cors": "^2.8.5",
@@ -28,6 +29,7 @@
     "@types/pg": "^8.11.10",
     "@types/swagger-ui-express": "^4.1.7",
     "@types/uuid": "^9.0.8",
+    "pino-pretty": "^11.3.0",
     "tsx": "^4.19.0",
     "typescript": "^5.6.2"
   }

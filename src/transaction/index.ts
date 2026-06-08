@@ -2,6 +2,12 @@ import { Pool, PoolClient } from 'pg';
 import { switchRole } from '../auth/role-switcher';
 import { translatePgError } from '../errors';
 
+export interface TransactionContext {
+  role?: string;
+  sub?: string;
+  ip?: string;
+}
+
 export async function executeInTransaction<T>(
   pool: Pool,
   role: string | undefined,

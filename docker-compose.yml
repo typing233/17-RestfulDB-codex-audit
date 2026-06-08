@@ -12,6 +12,38 @@ services:
     volumes:
       - pgdata:/var/lib/postgresql/data
       - ./scripts/seed.sql:/docker-entrypoint-initdb.d/01-seed.sql
+      - ./scripts/migrations/001_audit_log.sql:/docker-entrypoint-initdb.d/02-audit.sql
+      - ./scripts/migrations/002_views_example.sql:/docker-entrypoint-initdb.d/03-views.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  api:
+    build: .
+    ports:
+      - '3000:3000'
+    environment:
+      RESTFULDB_PORT: 3000
+      RESTFULDB_DB_HOST: db
+      RESTFULDB_DB_PORT: 5432
+      RESTFULDB_DB_NAME: restfuldb_demo
+      RESTFULDB_DB_USER: postgres
+      RESTFULDB_DB_PASSWORD: postgres
+      RESTFULDB_SCHEMAS: public
+      RESTFULDB_AUTH_ENABLED: "true"
+      RESTFULDB_JWT_SECRET: dev-secret-key
+      RESTFULDB_ANON_ROLE: anon
+      RESTFULDB_RATE_LIMIT_ENABLED: "true"
+      RESTFULDB_RATE_LIMIT_WINDOW_MS: "60000"
+      RESTFULDB_RATE_LIMIT_MAX: "100"
+      RESTFULDB_AUDIT_ENABLED: "true"
+      RESTFULDB_EXCLUDE_TABLES: _audit_log
+      RESTFULDB_LOG_LEVEL: info
+    depends_on:
+      db:
+        condition: service_healthy
 
 volumes:
   pgdata:

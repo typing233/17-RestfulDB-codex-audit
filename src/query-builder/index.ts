@@ -26,6 +26,7 @@ export class QueryBuilder {
     limit?: number;
     offset?: number;
     extraWhere?: { column: string; value: unknown };
+    keysetCondition?: { sql: string; params: unknown[] };
   }): BuiltQuery {
     const params: unknown[] = [];
     let paramIdx = 0;
@@ -73,6 +74,15 @@ export class QueryBuilder {
           params.push(f.value);
         }
       }
+    }
+
+    if (opts.keysetCondition && opts.keysetCondition.sql) {
+      const reindexed = opts.keysetCondition.sql.replace(/\$(\d+)/g, () => {
+        paramIdx++;
+        return `$${paramIdx}`;
+      });
+      whereClauses.push(reindexed);
+      params.push(...opts.keysetCondition.params);
     }
 
     if (whereClauses.length > 0) {
@@ -151,6 +161,24 @@ export class QueryBuilder {
     return { sql, params };
   }
 
+  buildEstimateCount(): BuiltQuery {
+    return {
+      sql: `SELECT reltuples::bigint AS total FROM pg_class WHERE oid = $1::regclass`,
+      params: [this.fullTableName],
+    };
+  }
+
+  buildPlannedCount(opts: {
+    filters?: FilterCondition[];
+    extraWhere?: { column: string; value: unknown };
+  }): BuiltQuery {
+    const countQuery = this.buildCount(opts);
+    return {
+      sql: `EXPLAIN (FORMAT JSON) ${countQuery.sql}`,
+      params: countQuery.params,
+    };
+  }
+
   buildInsert(data: Record<string, unknown>): BuiltQuery {
     const columns: string[] = [];
     const placeholders: string[] = [];
@@ -167,6 +195,32 @@ export class QueryBuilder {
     }
 
     const sql = `INSERT INTO ${this.fullTableName} (${columns.join(', ')}) VALUES (${placeholders.join(', ')}) RETURNING *`;
+    return { sql, params };
+  }
+
+  buildBulkInsert(rows: Record<string, unknown>[]): BuiltQuery {
+    if (rows.length === 0) return { sql: '', params: [] };
+
+    const validColumns = this.table.columns.filter(c => !c.isGenerated);
+    const colNames = validColumns.map(c => c.name);
+    const firstRow = rows[0];
+    const insertCols = colNames.filter(c => c in firstRow);
+
+    const params: unknown[] = [];
+    let paramIdx = 0;
+    const valueGroups: string[] = [];
+
+    for (const row of rows) {
+      const placeholders: string[] = [];
+      for (const col of insertCols) {
+        paramIdx++;
+        placeholders.push(`$${paramIdx}`);
+        params.push(row[col] ?? null);
+      }
+      valueGroups.push(`(${placeholders.join(', ')})`);
+    }
+
+    const sql = `INSERT INTO ${this.fullTableName} (${insertCols.map(quote).join(', ')}) VALUES ${valueGroups.join(', ')} RETURNING *`;
     return { sql, params };
   }
 
@@ -205,15 +259,113 @@ export class QueryBuilder {
     return { sql, params };
   }
 
+  buildBulkUpdate(data: Record<string, unknown>, filters: FilterCondition[], extraWhere?: { column: string; value: unknown }): BuiltQuery {
+    const setClauses: string[] = [];
+    const params: unknown[] = [];
+    let paramIdx = 0;
+
+    const pkCol = this.table.primaryKey?.columns[0] || 'id';
+
+    for (const [key, value] of Object.entries(data)) {
+      if (key === pkCol) continue;
+      if (key === 'version' && this.table.hasVersionColumn) continue;
+      const col = this.table.columns.find(c => c.name === key);
+      if (!col || col.isGenerated) continue;
+      paramIdx++;
+      setClauses.push(`${quote(key)} = $${paramIdx}`);
+      params.push(value);
+    }
+
+    if (this.table.hasVersionColumn) {
+      setClauses.push(`${quote('version')} = ${quote('version')} + 1`);
+    }
+
+    if (setClauses.length === 0) return { sql: '', params: [] };
+
+    let sql = `UPDATE ${this.fullTableName} SET ${setClauses.join(', ')}`;
+    const whereClauses: string[] = [];
+
+    if (extraWhere) {
+      paramIdx++;
+      whereClauses.push(`${quote(extraWhere.column)} = $${paramIdx}`);
+      params.push(extraWhere.value);
+    }
+
+    for (const f of filters) {
+      if (f.isNull) {
+        whereClauses.push(`${quote(f.column)} ${f.operator}`);
+        continue;
+      }
+      if (f.operator === 'IN' || f.operator === 'NOT IN') {
+        paramIdx++;
+        params.push(f.value);
+        whereClauses.push(f.operator === 'NOT IN'
+          ? `${quote(f.column)} != ALL($${paramIdx})`
+          : `${quote(f.column)} = ANY($${paramIdx})`);
+      } else {
+        paramIdx++;
+        whereClauses.push(`${quote(f.column)} ${f.operator} $${paramIdx}`);
+        params.push(f.value);
+      }
+    }
+
+    if (whereClauses.length > 0) {
+      sql += ` WHERE ${whereClauses.join(' AND ')}`;
+    }
+
+    sql += ' RETURNING *';
+    return { sql, params };
+  }
+
   buildDelete(id: unknown): BuiltQuery {
     const pkCol = this.table.primaryKey?.columns[0] || 'id';
     const sql = `DELETE FROM ${this.fullTableName} WHERE ${quote(pkCol)} = $1 RETURNING *`;
     return { sql, params: [id] };
+  }
+
+  buildBulkDelete(filters: FilterCondition[], extraWhere?: { column: string; value: unknown }): BuiltQuery {
+    const params: unknown[] = [];
+    let paramIdx = 0;
+
+    let sql = `DELETE FROM ${this.fullTableName}`;
+    const whereClauses: string[] = [];
+
+    if (extraWhere) {
+      paramIdx++;
+      whereClauses.push(`${quote(extraWhere.column)} = $${paramIdx}`);
+      params.push(extraWhere.value);
+    }
+
+    for (const f of filters) {
+      if (f.isNull) {
+        whereClauses.push(`${quote(f.column)} ${f.operator}`);
+        continue;
+      }
+      if (f.operator === 'IN' || f.operator === 'NOT IN') {
+        paramIdx++;
+        params.push(f.value);
+        whereClauses.push(f.operator === 'NOT IN'
+          ? `${quote(f.column)} != ALL($${paramIdx})`
+          : `${quote(f.column)} = ANY($${paramIdx})`);
+      } else {
+        paramIdx++;
+        whereClauses.push(`${quote(f.column)} ${f.operator} $${paramIdx}`);
+        params.push(f.value);
+      }
+    }
+
+    if (whereClauses.length > 0) {
+      sql += ` WHERE ${whereClauses.join(' AND ')}`;
+    }
+
+    sql += ' RETURNING *';
+    return { sql, params };
   }
 }
 
 export { parseFilters, FilterCondition } from './filter-parser';
 export { parseSelect } from './select-parser';
 export { parseOrder, OrderClause } from './order-parser';
-export { parsePagination, PaginationParams } from './pagination';
+export { parsePagination, PaginationParams, parseCountStrategy, CountStrategy } from './pagination';
 export { parseEmbed, EmbedRequest } from './embed-resolver';
+export { parseCursor, decodeCursor, encodeCursor, buildKeysetCondition, ensureStableSort, getCursorColumns, CursorParams } from './cursor-pagination';

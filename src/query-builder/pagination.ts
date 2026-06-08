@@ -5,6 +5,8 @@ export interface PaginationParams {
   offset: number;
 }
 
+export type CountStrategy = 'exact' | 'planned' | 'estimated';
+
 export function parsePagination(
   query: { limit?: string; offset?: string },
   config: Config['pagination'],
@@ -20,4 +22,10 @@ export function parsePagination(
   }
 
   return { limit, offset };
+}
+
+export function parseCountStrategy(preferHeader: string | undefined): CountStrategy {
+  if (!preferHeader) return 'exact';
+  const match = preferHeader.match(/count=(exact|planned|estimated)/);
+  return (match?.[1] as CountStrategy) || 'exact';
 }

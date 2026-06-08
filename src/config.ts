@@ -42,6 +42,18 @@ export interface Config {
     origins: string[];
     credentials: boolean;
   };
+  rateLimit: {
+    enabled: boolean;
+    windowMs: number;
+    maxRequests: number;
+    keyBy: 'ip' | 'role';
+  };
+  bodyLimit: string;
+  audit: {
+    enabled: boolean;
+    tableName: string;
+  };
+  bulkMaxRows: number;
 }
 
 export function loadConfig(): Config {
@@ -79,5 +91,17 @@ export function loadConfig(): Config {
       origins: env('RESTFULDB_CORS_ORIGINS', '*').split(',').map(s => s.trim()),
       credentials: env('RESTFULDB_CORS_CREDENTIALS', 'true') === 'true',
     },
+    rateLimit: {
+      enabled: env('RESTFULDB_RATE_LIMIT_ENABLED', 'false') === 'true',
+      windowMs: parseInt(env('RESTFULDB_RATE_LIMIT_WINDOW_MS', '60000'), 10),
+      maxRequests: parseInt(env('RESTFULDB_RATE_LIMIT_MAX', '100'), 10),
+      keyBy: env('RESTFULDB_RATE_LIMIT_KEY_BY', 'ip') as 'ip' | 'role',
+    },
+    bodyLimit: env('RESTFULDB_BODY_LIMIT', '10mb'),
+    audit: {
+      enabled: env('RESTFULDB_AUDIT_ENABLED', 'false') === 'true',
+      tableName: env('RESTFULDB_AUDIT_TABLE', '_audit_log'),
+    },
+    bulkMaxRows: parseInt(env('RESTFULDB_BULK_MAX_ROWS', '1000'), 10),
   };
 }

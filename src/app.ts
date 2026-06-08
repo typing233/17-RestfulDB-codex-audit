@@ -1,6 +1,7 @@
 import express, { Request, Response } from 'express';
 import cors from 'cors';
 import swaggerUi from 'swagger-ui-express';
+import pinoHttp from 'pino-http';
 import { Pool } from 'pg';
 import { Config } from './config';
 import { MetadataStore } from './introspection';
@@ -8,7 +9,11 @@ import { DynamicRouter } from './router';
 import { OpenAPIGenerator } from './openapi';
 import { createJwtMiddleware } from './auth';
 import { errorHandler } from './middleware/error-handler';
+import { createRateLimiter } from './middleware/rate-limiter';
+import { inputValidator } from './middleware/input-validator';
 import { SchemaScheduler } from './utils/scheduler';
+import { createHealthHandler } from './router/handlers/health';
+import logger from './logger';
 
 interface AppDeps {
   config: Config;
@@ -24,15 +29,32 @@ export function createApp(deps: AppDeps): express.Application {
 
   const app = express();
 
+  app.use(pinoHttp({ logger: logger as any, autoLogging: { ignore: (req) => (req as any).url === '/_health' } }));
+
   app.use(cors({
-    origin: config.cors.origins.includes('*') ? true : config.cors.origins,
+    origin: (origin, callback) => {
+      if (!origin) return callback(null, true);
+      for (const pattern of config.cors.origins) {
+        if (pattern === '*') return callback(null, true);
+        if (pattern.startsWith('/') && pattern.endsWith('/')) {
+          if (new RegExp(pattern.slice(1, -1)).test(origin)) return callback(null, true);
+        } else if (origin === pattern) {
+          return callback(null, true);
+        }
+      }
+      callback(new Error('Not allowed by CORS'));
+    },
     credentials: config.cors.credentials,
-    exposedHeaders: ['X-Total-Count', 'Content-Range'],
+    exposedHeaders: ['X-Total-Count', 'Content-Range', 'ETag', 'Link', 'Retry-After'],
   }));
 
-  app.use(express.json({ limit: '10mb' }));
+  app.use(express.json({ limit: config.bodyLimit }));
+
+  app.get('/_health', createHealthHandler(pool, metadataStore));
 
   app.use(createJwtMiddleware(config.auth));
+  app.use(createRateLimiter(config.rateLimit));
+  app.use(inputValidator);
 
   app.get('/docs/openapi.json', (_req: Request, res: Response) => {
     res.json(openapiGenerator.getSpec());
@@ -60,6 +82,7 @@ export function createApp(deps: AppDeps): express.Application {
     const tables = [...metadata.tables.values()].map(t => ({
       schema: t.schema,
       name: t.name,
+      relKind: t.relKind,
       columns: t.columns.length,
       primaryKey: t.primaryKey?.columns,
       foreignKeys: t.foreignKeys.map(fk => ({

@@ -1,7 +1,11 @@
 import { Request, Response } from 'express';
 import { Pool } from 'pg';
 import { TableMetadata, SchemaMetadata, MetadataStore } from '../../introspection';
-import { QueryBuilder, parseFilters, parseSelect, parseOrder, parsePagination, parseEmbed, EmbedRequest } from '../../query-builder';
+import {
+  QueryBuilder, parseFilters, parseSelect, parseOrder, parsePagination,
+  parseEmbed, EmbedRequest, parseCountStrategy,
+  parseCursor, decodeCursor, encodeCursor, buildKeysetCondition, ensureStableSort, getCursorColumns,
+} from '../../query-builder';
 import { executeInTransaction } from '../../transaction';
 import { Config } from '../../config';
 import { quote } from '../../utils/naming';
@@ -17,33 +21,60 @@ export function createListHandler(
     const query = req.query as Record<string, string>;
     const filters = parseFilters(query, table);
     const columns = parseSelect(query.select, table);
-    const order = parseOrder(query.order, table);
+    const rawOrder = parseOrder(query.order, table);
+    const order = ensureStableSort(rawOrder, table);
     const pagination = parsePagination(query, config.pagination);
     const embeds = parseEmbed(query.embed, table, metadataStore.get());
+    const countStrategy = parseCountStrategy(req.headers['prefer'] as string | undefined);
+    const cursor = parseCursor(query);
 
     const extra = extraWhere ? { column: extraWhere.column, value: req.params[extraWhere.paramName] } : undefined;
 
     const result = await executeInTransaction(pool, req.dbRole, async (client) => {
       const qb = new QueryBuilder(table);
 
+      let keysetCondition: { sql: string; params: unknown[] } | undefined;
+      if (cursor.after) {
+        const decoded = decodeCursor(cursor.after);
+        if (decoded) {
+          keysetCondition = buildKeysetCondition(decoded, order, 'forward', 0);
+        }
+      } else if (cursor.before) {
+        const decoded = decodeCursor(cursor.before);
+        if (decoded) {
+          keysetCondition = buildKeysetCondition(decoded, order, 'backward', 0);
+        }
+      }
+
       const selectQuery = qb.buildSelect({
         columns,
         filters,
         order,
         limit: pagination.limit,
-        offset: pagination.offset,
+        offset: cursor.after || cursor.before ? undefined : pagination.offset,
         extraWhere: extra,
+        keysetCondition,
       });
 
-      const countQuery = qb.buildCount({ filters, extraWhere: extra });
+      let total: number;
 
-      const [dataResult, countResult] = await Promise.all([
-        client.query(selectQuery.sql, selectQuery.params),
-        client.query(countQuery.sql, countQuery.params),
-      ]);
+      if (countStrategy === 'estimated') {
+        const estQuery = qb.buildEstimateCount();
+        const estResult = await client.query(estQuery.sql, estQuery.params);
+        total = parseInt(estResult.rows[0]?.total ?? '0', 10);
+      } else if (countStrategy === 'planned') {
+        const planQuery = qb.buildPlannedCount({ filters, extraWhere: extra });
+        const planResult = await client.query(planQuery.sql, planQuery.params);
+        const plan = planResult.rows[0]?.['QUERY PLAN'];
+        total = Array.isArray(plan) ? (plan[0]?.Plan?.['Plan Rows'] ?? 0) : 0;
+      } else {
+        const countQuery = qb.buildCount({ filters, extraWhere: extra });
+        const countResult = await client.query(countQuery.sql, countQuery.params);
+        total = parseInt(countResult.rows[0].total, 10);
+      }
 
+      const dataResult = await client.query(selectQuery.sql, selectQuery.params);
       const rows = dataResult.rows;
-      const total = parseInt(countResult.rows[0].total, 10);
 
       if (embeds.length > 0) {
         await resolveEmbeds(client, rows, embeds, table, metadataStore.get());
@@ -58,6 +89,24 @@ export function createListHandler(
 
     res.set('X-Total-Count', String(total));
     res.set('Content-Range', `items ${start}-${end >= 0 ? end : 0}/${total}`);
+    res.set('Preference-Applied', `count=${countStrategy}`);
+
+    if (rows.length > 0) {
+      const cursorCols = getCursorColumns(order);
+      const links: string[] = [];
+      const lastRow = rows[rows.length - 1];
+      const nextCursor = encodeCursor(lastRow, cursorCols);
+      links.push(`<${req.path}?after=${nextCursor}&limit=${pagination.limit}>; rel="next"`);
+
+      if (rows.length > 0) {
+        const firstRow = rows[0];
+        const prevCursor = encodeCursor(firstRow, cursorCols);
+        links.push(`<${req.path}?before=${prevCursor}&limit=${pagination.limit}>; rel="prev"`);
+      }
+
+      res.set('Link', links.join(', '));
+    }
+
     res.json(rows);
   };
 }
@@ -77,10 +126,6 @@ async function resolveEmbeds(
         continue;
       }
 
-      const childQb = new QueryBuilder(embed.table);
-      const q = childQb.buildSelect({
-        filters: [{ column: embed.parentColumn, operator: '=', value: fkValues, isNull: false }],
-      });
       const overrideSql = `SELECT * FROM ${quote(embed.table.schema)}.${quote(embed.table.name)} WHERE ${quote(embed.parentColumn)} = ANY($1)`;
       const result = await client.query(overrideSql, [fkValues]);
       const map = new Map<unknown, Record<string, unknown>>();

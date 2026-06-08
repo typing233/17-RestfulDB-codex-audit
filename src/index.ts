@@ -5,6 +5,7 @@ import { DynamicRouter } from './router';
 import { OpenAPIGenerator } from './openapi';
 import { SchemaScheduler } from './utils/scheduler';
 import { createApp } from './app';
+import logger from './logger';
 
 async function main() {
   const config = loadConfig();
@@ -12,15 +13,15 @@ async function main() {
 
   try {
     await pool.query('SELECT 1');
-    console.log('Database connected successfully');
+    logger.info('Database connected successfully');
   } catch (err: any) {
-    console.error('Failed to connect to database:', err.message);
+    logger.fatal({ err }, 'Failed to connect to database');
     process.exit(1);
   }
 
   const introspector = new Introspector(pool, config.schemas, config.introspection.excludeTables);
   const metadata = await introspector.discover();
-  console.log(`Discovered ${metadata.tables.size} tables in schemas: ${config.schemas.join(', ')}`);
+  logger.info({ schemas: config.schemas, tables: metadata.tables.size }, 'Schema introspection complete');
 
   const metadataStore = new MetadataStore(metadata);
   const dynamicRouter = new DynamicRouter(pool, metadataStore, config);
@@ -35,29 +36,23 @@ async function main() {
   const app = createApp({ config, pool, metadataStore, dynamicRouter, openapiGenerator, scheduler });
 
   app.listen(config.port, () => {
-    console.log(`RestfulDB running on http://localhost:${config.port}`);
-    console.log(`Swagger docs: http://localhost:${config.port}/docs`);
-    console.log(`Schema auto-refresh interval: ${config.introspection.intervalMs}ms`);
+    logger.info({ port: config.port, docs: `http://localhost:${config.port}/docs` }, 'RestfulDB running');
 
-    for (const [key, table] of metadata.tables) {
-      const routes = [`GET /${table.name}`, `POST /${table.name}`, `GET /${table.name}/:id`, `PUT /${table.name}/:id`, `PATCH /${table.name}/:id`, `DELETE /${table.name}/:id`];
-      for (const ref of table.referencedBy) {
-        routes.push(`GET /${table.name}/:id/${ref.referencedTable}`);
-        routes.push(`POST /${table.name}/:id/${ref.referencedTable}`);
-      }
-      console.log(`  ${table.schema}.${table.name}: ${routes.length} endpoints`);
+    for (const [, table] of metadata.tables) {
+      const kind = table.relKind === 'table' ? '' : ` [${table.relKind}]`;
+      logger.debug({ table: `${table.schema}.${table.name}`, kind: table.relKind }, 'Registered endpoints');
     }
   });
 
   process.on('SIGTERM', async () => {
-    console.log('Shutting down...');
+    logger.info('Shutting down...');
     scheduler.stop();
     await pool.end();
     process.exit(0);
   });
 
   process.on('SIGINT', async () => {
-    console.log('Shutting down...');
+    logger.info('Shutting down...');
     scheduler.stop();
     await pool.end();
     process.exit(0);
@@ -65,6 +60,6 @@ async function main() {
 }
 
 main().catch((err) => {
-  console.error('Fatal error:', err);
+  logger.fatal({ err }, 'Fatal error');
   process.exit(1);
 });

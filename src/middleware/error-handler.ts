@@ -1,5 +1,6 @@
 import { Request, Response, NextFunction, ErrorRequestHandler } from 'express';
 import { AppError } from '../errors';
+import logger from '../logger';
 
 export const errorHandler: ErrorRequestHandler = (err: Error, req: Request, res: Response, _next: NextFunction) => {
   if (err instanceof AppError) {
@@ -11,7 +12,7 @@ export const errorHandler: ErrorRequestHandler = (err: Error, req: Request, res:
       },
     });
   } else {
-    console.error('Unhandled error:', err);
+    logger.error({ err, method: req.method, path: req.path }, 'Unhandled error');
     res.status(500).json({
       error: {
         code: 'INTERNAL_ERROR',

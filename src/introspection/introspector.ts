@@ -6,13 +6,20 @@ import {
   PrimaryKeyMetadata,
   ForeignKeyMetadata,
   UniqueConstraintMetadata,
+  RelKind,
+  ColumnPrivilege,
+  TablePrivileges,
 } from './metadata';
 import {
   TABLES_QUERY,
+  VIEWS_QUERY,
+  MATERIALIZED_VIEWS_QUERY,
   COLUMNS_QUERY,
   PRIMARY_KEYS_QUERY,
   FOREIGN_KEYS_QUERY,
   UNIQUE_CONSTRAINTS_QUERY,
+  TABLE_PRIVILEGES_QUERY,
+  COLUMN_PRIVILEGES_QUERY,
 } from './queries';
 
 function parsePgArray(val: unknown): string[] {
@@ -38,26 +45,49 @@ export class Introspector {
   async discover(): Promise<SchemaMetadata> {
     const tables = new Map<string, TableMetadata>();
 
-    const [tablesResult, columnsResult, pksResult, fksResult, uniqResult] = await Promise.all([
+    const [
+      tablesResult,
+      viewsResult,
+      matviewsResult,
+      columnsResult,
+      pksResult,
+      fksResult,
+      uniqResult,
+      tablePrivResult,
+      colPrivResult,
+    ] = await Promise.all([
       this.pool.query(TABLES_QUERY, [this.schemas]),
+      this.pool.query(VIEWS_QUERY, [this.schemas]),
+      this.pool.query(MATERIALIZED_VIEWS_QUERY, [this.schemas]),
       this.pool.query(COLUMNS_QUERY, [this.schemas]),
       this.pool.query(PRIMARY_KEYS_QUERY, [this.schemas]),
       this.pool.query(FOREIGN_KEYS_QUERY, [this.schemas]),
       this.pool.query(UNIQUE_CONSTRAINTS_QUERY, [this.schemas]),
+      this.pool.query(TABLE_PRIVILEGES_QUERY, [this.schemas]),
+      this.pool.query(COLUMN_PRIVILEGES_QUERY, [this.schemas]),
     ]);
 
-    for (const row of tablesResult.rows) {
+    const allRelations = [
+      ...tablesResult.rows,
+      ...viewsResult.rows,
+      ...matviewsResult.rows,
+    ];
+
+    for (const row of allRelations) {
       if (this.excludeTables.includes(row.table_name)) continue;
       const key = `${row.table_schema}.${row.table_name}`;
       tables.set(key, {
         schema: row.table_schema,
         name: row.table_name,
+        relKind: row.rel_kind as RelKind,
         columns: [],
         primaryKey: null,
         foreignKeys: [],
         referencedBy: [],
         uniqueConstraints: [],
         hasVersionColumn: false,
+        privileges: { select: new Set(), insert: new Set(), update: new Set(), delete: new Set() },
+        columnPrivileges: [],
       });
     }
 
@@ -135,6 +165,28 @@ export class Introspector {
         columns: parsePgArray(row.columns),
       };
       table.uniqueConstraints.push(uc);
+    }
+
+    for (const row of tablePrivResult.rows) {
+      const key = `${row.table_schema}.${row.table_name}`;
+      const table = tables.get(key);
+      if (!table) continue;
+
+      const priv = row.privilege_type.toLowerCase() as keyof TablePrivileges;
+      table.privileges[priv].add(row.grantee);
+    }
+
+    for (const row of colPrivResult.rows) {
+      const key = `${row.table_schema}.${row.table_name}`;
+      const table = tables.get(key);
+      if (!table) continue;
+
+      const cp: ColumnPrivilege = {
+        column: row.column_name,
+        grantee: row.grantee,
+        privilegeType: row.privilege_type,
+      };
+      table.columnPrivileges.push(cp);
     }
 
     return { tables, lastRefreshed: new Date() };

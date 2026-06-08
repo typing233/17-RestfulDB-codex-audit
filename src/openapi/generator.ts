@@ -7,7 +7,7 @@ interface OpenAPISpec {
   info: { title: string; version: string; description: string };
   servers: { url: string }[];
   paths: Record<string, unknown>;
-  components: { schemas: Record<string, unknown>; securitySchemes?: Record<string, unknown> };
+  components: { schemas: Record<string, unknown>; securitySchemes?: Record<string, unknown>; parameters?: Record<string, unknown> };
   security?: unknown[];
 }
 
@@ -20,11 +20,12 @@ export class OpenAPIGenerator {
 
   rebuild(metadata: SchemaMetadata): void {
     this.spec = this.createBaseSpec();
-    this.spec.components.schemas = {};
+    this.spec.components.schemas = this.baseSchemas();
     this.spec.paths = {};
 
-    for (const [key, table] of metadata.tables) {
-      if (!table.primaryKey) continue;
+    this.addHealthPath();
+
+    for (const [, table] of metadata.tables) {
       this.generateSchemas(table);
       this.generatePaths(table, metadata);
     }
@@ -40,7 +41,7 @@ export class OpenAPIGenerator {
       info: {
         title: 'RestfulDB Auto-Generated API',
         version: '1.0.0',
-        description: 'Automatically generated REST API from PostgreSQL schema',
+        description: 'Automatically generated REST API from PostgreSQL schema. Supports CRUD operations, bulk writes, cursor pagination, nested resource embedding, and Row-Level Security.',
       },
       servers: [{ url: `http://localhost:${this.config.port}` }],
       paths: {},
@@ -49,6 +50,26 @@ export class OpenAPIGenerator {
         securitySchemes: this.config.auth.enabled ? {
           bearerAuth: { type: 'http', scheme: 'bearer', bearerFormat: 'JWT' },
         } : undefined,
+        parameters: {
+          preferHeader: {
+            name: 'Prefer',
+            in: 'header',
+            schema: { type: 'string', enum: ['count=exact', 'count=planned', 'count=estimated'] },
+            description: 'Count strategy for pagination totals',
+          },
+          afterCursor: {
+            name: 'after',
+            in: 'query',
+            schema: { type: 'string' },
+            description: 'Cursor for forward pagination',
+          },
+          beforeCursor: {
+            name: 'before',
+            in: 'query',
+            schema: { type: 'string' },
+            description: 'Cursor for backward pagination',
+          },
+        },
       },
     };
 
@@ -57,6 +78,62 @@ export class OpenAPIGenerator {
     }
 
     return spec;
+  }
+
+  private baseSchemas(): Record<string, unknown> {
+    return {
+      ErrorResponse: {
+        type: 'object',
+        properties: {
+          error: {
+            type: 'object',
+            properties: {
+              code: { type: 'string' },
+              message: { type: 'string' },
+              details: {},
+            },
+            required: ['code', 'message'],
+          },
+        },
+      },
+      HealthResponse: {
+        type: 'object',
+        properties: {
+          status: { type: 'string', enum: ['healthy', 'unhealthy'] },
+          version: { type: 'string' },
+          uptime: { type: 'integer' },
+          database: {
+            type: 'object',
+            properties: {
+              connected: { type: 'boolean' },
+              latencyMs: { type: 'integer' },
+            },
+          },
+          tablesDiscovered: { type: 'integer' },
+          lastSchemaRefresh: { type: 'string', format: 'date-time' },
+        },
+      },
+    };
+  }
+
+  private addHealthPath(): void {
+    this.spec.paths['/_health'] = {
+      get: {
+        summary: 'Health check',
+        tags: ['System'],
+        security: [],
+        responses: {
+          '200': {
+            description: 'Service is healthy',
+            content: { 'application/json': { schema: { $ref: '#/components/schemas/HealthResponse' } } },
+          },
+          '503': {
+            description: 'Service is unhealthy',
+            content: { 'application/json': { schema: { $ref: '#/components/schemas/HealthResponse' } } },
+          },
+        },
+      },
+    };
   }
 
   private generateSchemas(table: TableMetadata): void {
@@ -94,36 +171,48 @@ export class OpenAPIGenerator {
       properties: responseProps,
     };
 
-    this.spec.components.schemas[createName] = {
-      type: 'object',
-      properties: createProps,
-      ...(createRequired.length > 0 ? { required: createRequired } : {}),
-    };
+    if (table.relKind === 'table') {
+      this.spec.components.schemas[createName] = {
+        type: 'object',
+        properties: createProps,
+        ...(createRequired.length > 0 ? { required: createRequired } : {}),
+      };
 
-    this.spec.components.schemas[updateName] = {
-      type: 'object',
-      properties: updateProps,
-    };
+      this.spec.components.schemas[updateName] = {
+        type: 'object',
+        properties: updateProps,
+      };
+    }
   }
 
   private generatePaths(table: TableMetadata, metadata: SchemaMetadata): void {
+    const isReadOnly = table.relKind === 'view' || table.relKind === 'matview';
+    const hasId = !!table.primaryKey;
     const basePath = `/${table.name}`;
-    const pkCol = table.primaryKey?.columns[0] || 'id';
     const responseName = this.schemaName(table.name, 'Response');
     const createName = this.schemaName(table.name, 'Create');
     const updateName = this.schemaName(table.name, 'Update');
 
-    this.spec.paths[basePath] = {
+    const tags = [table.name + (isReadOnly ? ` [${table.relKind}]` : '')];
+
+    const listOp: any = {
       get: {
         summary: `List ${table.name}`,
-        tags: [table.name],
-        parameters: this.listParameters(table),
+        tags,
+        parameters: [
+          ...this.listParameters(table),
+          { $ref: '#/components/parameters/preferHeader' },
+          { $ref: '#/components/parameters/afterCursor' },
+          { $ref: '#/components/parameters/beforeCursor' },
+        ],
         responses: {
           '200': {
             description: 'Success',
             headers: {
               'X-Total-Count': { schema: { type: 'integer' } },
               'Content-Range': { schema: { type: 'string' } },
+              'Link': { schema: { type: 'string' }, description: 'Cursor pagination links' },
+              'Preference-Applied': { schema: { type: 'string' } },
             },
             content: {
               'application/json': {
@@ -131,180 +220,245 @@ export class OpenAPIGenerator {
               },
             },
           },
+          '401': { description: 'Unauthorized', content: { 'application/json': { schema: { $ref: '#/components/schemas/ErrorResponse' } } } },
+          '429': { description: 'Rate limited' },
         },
       },
-      post: {
-        summary: `Create ${table.name}`,
-        tags: [table.name],
+    };
+
+    if (!isReadOnly && hasId) {
+      listOp.post = {
+        summary: `Create ${table.name} (single or bulk)`,
+        tags,
         requestBody: {
           required: true,
           content: {
-            'application/json': { schema: { $ref: `#/components/schemas/${createName}` } },
+            'application/json': {
+              schema: {
+                oneOf: [
+                  { $ref: `#/components/schemas/${createName}` },
+                  { type: 'array', items: { $ref: `#/components/schemas/${createName}` }, maxItems: this.config.bulkMaxRows },
+                ],
+              },
+            },
           },
         },
         responses: {
           '201': {
             description: 'Created',
+            headers: { 'ETag': { schema: { type: 'string' } } },
             content: {
-              'application/json': { schema: { $ref: `#/components/schemas/${responseName}` } },
-            },
-          },
-        },
-      },
-    };
-
-    this.spec.paths[`${basePath}/{id}`] = {
-      get: {
-        summary: `Get ${table.name} by ID`,
-        tags: [table.name],
-        parameters: [
-          { name: 'id', in: 'path', required: true, schema: { type: 'string' } },
-          { name: 'select', in: 'query', schema: { type: 'string' }, description: 'Comma-separated fields' },
-          { name: 'embed', in: 'query', schema: { type: 'string' }, description: 'Relations to embed' },
-        ],
-        responses: {
-          '200': {
-            description: 'Success',
-            content: {
-              'application/json': { schema: { $ref: `#/components/schemas/${responseName}` } },
-            },
-          },
-          '404': { description: 'Not found' },
-        },
-      },
-      put: {
-        summary: `Replace ${table.name}`,
-        tags: [table.name],
-        parameters: [{ name: 'id', in: 'path', required: true, schema: { type: 'string' } }],
-        requestBody: {
-          required: true,
-          content: {
-            'application/json': { schema: { $ref: `#/components/schemas/${updateName}` } },
-          },
-        },
-        responses: {
-          '200': {
-            description: 'Updated',
-            content: {
-              'application/json': { schema: { $ref: `#/components/schemas/${responseName}` } },
-            },
-          },
-          '404': { description: 'Not found' },
-          '409': { description: 'Version conflict' },
-        },
-      },
-      patch: {
-        summary: `Partially update ${table.name}`,
-        tags: [table.name],
-        parameters: [{ name: 'id', in: 'path', required: true, schema: { type: 'string' } }],
-        requestBody: {
-          required: true,
-          content: {
-            'application/json': { schema: { $ref: `#/components/schemas/${updateName}` } },
-          },
-        },
-        responses: {
-          '200': {
-            description: 'Updated',
-            content: {
-              'application/json': { schema: { $ref: `#/components/schemas/${responseName}` } },
-            },
-          },
-          '404': { description: 'Not found' },
-          '409': { description: 'Version conflict' },
-        },
-      },
-      delete: {
-        summary: `Delete ${table.name}`,
-        tags: [table.name],
-        parameters: [{ name: 'id', in: 'path', required: true, schema: { type: 'string' } }],
-        responses: {
-          '200': {
-            description: 'Deleted',
-            content: {
-              'application/json': { schema: { $ref: `#/components/schemas/${responseName}` } },
-            },
-          },
-          '404': { description: 'Not found' },
-        },
-      },
-    };
-
-    for (const ref of table.referencedBy) {
-      const childTable = metadata.tables.get(`${ref.referencedSchema}.${ref.referencedTable}`);
-      if (!childTable || !childTable.primaryKey) continue;
-
-      const childResponseName = this.schemaName(childTable.name, 'Response');
-      const childCreateName = this.schemaName(childTable.name, 'Create');
-      const nestedPath = `${basePath}/{${table.name}Id}/${childTable.name}`;
-
-      this.spec.paths[nestedPath] = {
-        get: {
-          summary: `List ${childTable.name} for ${table.name}`,
-          tags: [table.name, childTable.name],
-          parameters: [
-            { name: `${table.name}Id`, in: 'path', required: true, schema: { type: 'string' } },
-            ...this.listParameters(childTable),
-          ],
-          responses: {
-            '200': {
-              description: 'Success',
-              headers: {
-                'X-Total-Count': { schema: { type: 'integer' } },
-                'Content-Range': { schema: { type: 'string' } },
-              },
-              content: {
-                'application/json': {
-                  schema: { type: 'array', items: { $ref: `#/components/schemas/${childResponseName}` } },
+              'application/json': {
+                schema: {
+                  oneOf: [
+                    { $ref: `#/components/schemas/${responseName}` },
+                    { type: 'array', items: { $ref: `#/components/schemas/${responseName}` } },
+                  ],
                 },
               },
             },
           },
+          '400': { description: 'Validation error', content: { 'application/json': { schema: { $ref: '#/components/schemas/ErrorResponse' } } } },
+          '403': { description: 'Forbidden' },
         },
-        post: {
-          summary: `Create ${childTable.name} for ${table.name}`,
-          tags: [table.name, childTable.name],
-          parameters: [
-            { name: `${table.name}Id`, in: 'path', required: true, schema: { type: 'string' } },
-          ],
-          requestBody: {
-            required: true,
-            content: {
-              'application/json': { schema: { $ref: `#/components/schemas/${childCreateName}` } },
-            },
+      };
+
+      listOp.patch = {
+        summary: `Bulk update ${table.name}`,
+        description: 'Update multiple records matching query filters',
+        tags,
+        parameters: this.filterParameters(table),
+        requestBody: {
+          required: true,
+          content: {
+            'application/json': { schema: { $ref: `#/components/schemas/${updateName}` } },
           },
+        },
+        responses: {
+          '200': {
+            description: 'Updated records',
+            content: { 'application/json': { schema: { type: 'array', items: { $ref: `#/components/schemas/${responseName}` } } } },
+          },
+          '400': { description: 'Validation error' },
+        },
+      };
+
+      listOp.delete = {
+        summary: `Bulk delete ${table.name}`,
+        description: 'Delete multiple records matching query filters',
+        tags,
+        parameters: this.filterParameters(table),
+        responses: {
+          '200': {
+            description: 'Deleted records',
+            content: { 'application/json': { schema: { type: 'array', items: { $ref: `#/components/schemas/${responseName}` } } } },
+          },
+          '400': { description: 'Validation error (filter required)' },
+        },
+      };
+    }
+
+    this.spec.paths[basePath] = listOp;
+
+    if (hasId) {
+      const detailPath: any = {
+        get: {
+          summary: `Get ${table.name} by ID`,
+          tags,
+          parameters: [
+            { name: 'id', in: 'path', required: true, schema: { type: 'string' } },
+            { name: 'select', in: 'query', schema: { type: 'string' }, description: 'Comma-separated fields' },
+            { name: 'embed', in: 'query', schema: { type: 'string' }, description: 'Relations to embed' },
+          ],
           responses: {
-            '201': {
-              description: 'Created',
-              content: {
-                'application/json': { schema: { $ref: `#/components/schemas/${childResponseName}` } },
-              },
+            '200': {
+              description: 'Success',
+              content: { 'application/json': { schema: { $ref: `#/components/schemas/${responseName}` } } },
             },
+            '404': { description: 'Not found', content: { 'application/json': { schema: { $ref: '#/components/schemas/ErrorResponse' } } } },
           },
         },
       };
+
+      if (!isReadOnly) {
+        detailPath.put = {
+          summary: `Replace ${table.name}`,
+          tags,
+          parameters: [
+            { name: 'id', in: 'path', required: true, schema: { type: 'string' } },
+            { name: 'If-Match', in: 'header', schema: { type: 'string' }, description: 'Version for optimistic locking' },
+          ],
+          requestBody: {
+            required: true,
+            content: { 'application/json': { schema: { $ref: `#/components/schemas/${updateName}` } } },
+          },
+          responses: {
+            '200': {
+              description: 'Updated',
+              headers: { 'ETag': { schema: { type: 'string' } } },
+              content: { 'application/json': { schema: { $ref: `#/components/schemas/${responseName}` } } },
+            },
+            '404': { description: 'Not found' },
+            '409': { description: 'Version conflict', content: { 'application/json': { schema: { $ref: '#/components/schemas/ErrorResponse' } } } },
+          },
+        };
+
+        detailPath.patch = {
+          summary: `Partially update ${table.name}`,
+          tags,
+          parameters: [
+            { name: 'id', in: 'path', required: true, schema: { type: 'string' } },
+            { name: 'If-Match', in: 'header', schema: { type: 'string' }, description: 'Version for optimistic locking' },
+          ],
+          requestBody: {
+            required: true,
+            content: { 'application/json': { schema: { $ref: `#/components/schemas/${updateName}` } } },
+          },
+          responses: {
+            '200': {
+              description: 'Updated',
+              headers: { 'ETag': { schema: { type: 'string' } } },
+              content: { 'application/json': { schema: { $ref: `#/components/schemas/${responseName}` } } },
+            },
+            '404': { description: 'Not found' },
+            '409': { description: 'Version conflict' },
+          },
+        };
+
+        detailPath.delete = {
+          summary: `Delete ${table.name}`,
+          tags,
+          parameters: [{ name: 'id', in: 'path', required: true, schema: { type: 'string' } }],
+          responses: {
+            '200': {
+              description: 'Deleted',
+              content: { 'application/json': { schema: { $ref: `#/components/schemas/${responseName}` } } },
+            },
+            '404': { description: 'Not found' },
+          },
+        };
+      }
+
+      this.spec.paths[`${basePath}/{id}`] = detailPath;
+    }
+
+    if (!isReadOnly && hasId) {
+      for (const ref of table.referencedBy) {
+        const childTable = metadata.tables.get(`${ref.referencedSchema}.${ref.referencedTable}`);
+        if (!childTable || !childTable.primaryKey) continue;
+        if (childTable.relKind !== 'table') continue;
+
+        const childResponseName = this.schemaName(childTable.name, 'Response');
+        const childCreateName = this.schemaName(childTable.name, 'Create');
+        const nestedPath = `${basePath}/{${table.name}Id}/${childTable.name}`;
+
+        this.spec.paths[nestedPath] = {
+          get: {
+            summary: `List ${childTable.name} for ${table.name}`,
+            tags: [table.name, childTable.name],
+            parameters: [
+              { name: `${table.name}Id`, in: 'path', required: true, schema: { type: 'string' } },
+              ...this.listParameters(childTable),
+            ],
+            responses: {
+              '200': {
+                description: 'Success',
+                headers: {
+                  'X-Total-Count': { schema: { type: 'integer' } },
+                  'Content-Range': { schema: { type: 'string' } },
+                },
+                content: {
+                  'application/json': {
+                    schema: { type: 'array', items: { $ref: `#/components/schemas/${childResponseName}` } },
+                  },
+                },
+              },
+            },
+          },
+          post: {
+            summary: `Create ${childTable.name} for ${table.name}`,
+            tags: [table.name, childTable.name],
+            parameters: [
+              { name: `${table.name}Id`, in: 'path', required: true, schema: { type: 'string' } },
+            ],
+            requestBody: {
+              required: true,
+              content: {
+                'application/json': { schema: { $ref: `#/components/schemas/${childCreateName}` } },
+              },
+            },
+            responses: {
+              '201': {
+                description: 'Created',
+                content: {
+                  'application/json': { schema: { $ref: `#/components/schemas/${childResponseName}` } },
+                },
+              },
+            },
+          },
+        };
+      }
     }
   }
 
   private listParameters(table: TableMetadata): unknown[] {
-    const params: unknown[] = [
+    return [
       { name: 'select', in: 'query', schema: { type: 'string' }, description: 'Comma-separated fields to return' },
       { name: 'order', in: 'query', schema: { type: 'string' }, description: 'Sort: column.asc or column.desc' },
-      { name: 'limit', in: 'query', schema: { type: 'integer', default: this.config.pagination.defaultLimit } },
+      { name: 'limit', in: 'query', schema: { type: 'integer', default: this.config.pagination.defaultLimit, maximum: this.config.pagination.maxLimit } },
       { name: 'offset', in: 'query', schema: { type: 'integer', default: 0 } },
-      { name: 'embed', in: 'query', schema: { type: 'string' }, description: 'Relations to preload' },
+      { name: 'embed', in: 'query', schema: { type: 'string' }, description: 'Relations to preload (dot-notation for nested)' },
+      ...this.filterParameters(table),
     ];
+  }
 
-    for (const col of table.columns) {
-      params.push({
-        name: col.name,
-        in: 'query',
-        schema: { type: 'string' },
-        description: `Filter by ${col.name}. Operators: eq, neq, gt, gte, lt, lte, like, ilike, in, between`,
-      });
-    }
-
-    return params;
+  private filterParameters(table: TableMetadata): unknown[] {
+    return table.columns.map(col => ({
+      name: col.name,
+      in: 'query',
+      schema: { type: 'string' },
+      description: `Filter by ${col.name}. Operators: eq, neq, gt, gte, lt, lte, like, ilike, in, notin, is, isnot, between`,
+    }));
   }
 
   private schemaName(tableName: string, suffix: string): string {

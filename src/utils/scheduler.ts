@@ -2,6 +2,7 @@ import { Introspector, MetadataStore, SchemaMetadata } from '../introspection';
 import { DynamicRouter } from '../router';
 import { OpenAPIGenerator } from '../openapi';
 import crypto from 'crypto';
+import logger from '../logger';
 
 export class SchemaScheduler {
   private interval: NodeJS.Timeout | null = null;
@@ -21,7 +22,7 @@ export class SchemaScheduler {
       try {
         await this.refresh();
       } catch (err) {
-        console.error('Schema refresh failed:', err);
+        logger.error({ err }, 'Schema refresh failed');
       }
     }, intervalMs);
   }
@@ -42,7 +43,7 @@ export class SchemaScheduler {
       this.dynamicRouter.rebuild(newMetadata);
       this.openapiGenerator.rebuild(newMetadata);
       this.lastHash = newHash;
-      console.log(`Schema refreshed: ${newMetadata.tables.size} tables discovered`);
+      logger.info({ tables: newMetadata.tables.size }, 'Schema refreshed');
       return true;
     }
     return false;
@@ -54,7 +55,7 @@ export class SchemaScheduler {
       const t = metadata.tables.get(k)!;
       const cols = t.columns.map(c => `${c.name}:${c.udtName}`).join(',');
       const fks = t.foreignKeys.map(f => `${f.columns.join('+')}->${f.referencedTable}`).join(',');
-      return `${k}[${cols}][${fks}]`;
+      return `${k}[${t.relKind}][${cols}][${fks}]`;
     }).join('|');
 
     return crypto.createHash('md5').update(summary).digest('hex');

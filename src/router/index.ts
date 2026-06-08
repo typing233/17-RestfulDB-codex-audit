@@ -7,6 +7,9 @@ import { createDetailHandler } from './handlers/detail';
 import { createCreateHandler } from './handlers/create';
 import { createUpdateHandler } from './handlers/update';
 import { createDeleteHandler } from './handlers/delete';
+import { createBulkCreateHandler, createBulkUpdateHandler, createBulkDeleteHandler } from './handlers/bulk';
+import { createPermissionCheck } from '../middleware/permission-check';
+import { AuditLogger } from '../audit/audit-logger';
 
 export class DynamicRouter {
   private currentRouter: Router;
@@ -22,42 +25,64 @@ export class DynamicRouter {
   rebuild(metadata: SchemaMetadata): void {
     const router = Router();
 
-    for (const [key, table] of metadata.tables) {
-      if (!table.primaryKey) continue;
-
+    for (const [, table] of metadata.tables) {
+      const isReadOnly = table.relKind === 'view' || table.relKind === 'matview';
+      const hasId = !!table.primaryKey;
       const basePath = `/${table.name}`;
 
       router.get(
         basePath,
+        createPermissionCheck(table, this.metadataStore, 'select'),
         this.asyncHandler(createListHandler(table, this.pool, this.metadataStore, this.config)),
       );
 
-      router.get(
-        `${basePath}/:id`,
-        this.asyncHandler(createDetailHandler(table, this.pool, this.metadataStore, this.config)),
-      );
+      if (hasId) {
+        router.get(
+          `${basePath}/:id`,
+          createPermissionCheck(table, this.metadataStore, 'select'),
+          this.asyncHandler(createDetailHandler(table, this.pool, this.metadataStore, this.config)),
+        );
+      }
 
-      router.post(
-        basePath,
-        this.asyncHandler(createCreateHandler(table, this.pool, this.metadataStore)),
-      );
+      if (!isReadOnly && hasId) {
+        router.post(
+          basePath,
+          createPermissionCheck(table, this.metadataStore, 'insert'),
+          this.asyncHandler(createCreateHandler(table, this.pool, this.metadataStore, this.config)),
+        );
 
-      router.put(
-        `${basePath}/:id`,
-        this.asyncHandler(createUpdateHandler(table, this.pool, this.metadataStore)),
-      );
+        router.put(
+          `${basePath}/:id`,
+          createPermissionCheck(table, this.metadataStore, 'update'),
+          this.asyncHandler(createUpdateHandler(table, this.pool, this.metadataStore, this.config)),
+        );
 
-      router.patch(
-        `${basePath}/:id`,
-        this.asyncHandler(createUpdateHandler(table, this.pool, this.metadataStore)),
-      );
+        router.patch(
+          `${basePath}/:id`,
+          createPermissionCheck(table, this.metadataStore, 'update'),
+          this.asyncHandler(createUpdateHandler(table, this.pool, this.metadataStore, this.config)),
+        );
 
-      router.delete(
-        `${basePath}/:id`,
-        this.asyncHandler(createDeleteHandler(table, this.pool)),
-      );
+        router.delete(
+          `${basePath}/:id`,
+          createPermissionCheck(table, this.metadataStore, 'delete'),
+          this.asyncHandler(createDeleteHandler(table, this.pool, this.config)),
+        );
 
-      this.registerNestedRoutes(router, table, metadata);
+        router.patch(
+          basePath,
+          createPermissionCheck(table, this.metadataStore, 'update'),
+          this.asyncHandler(createBulkUpdateHandler(table, this.pool, this.metadataStore, this.config)),
+        );
+
+        router.delete(
+          basePath,
+          createPermissionCheck(table, this.metadataStore, 'delete'),
+          this.asyncHandler(createBulkDeleteHandler(table, this.pool, this.config)),
+        );
+
+        this.registerNestedRoutes(router, table, metadata);
+      }
     }
 
     this.currentRouter = router;
@@ -67,15 +92,15 @@ export class DynamicRouter {
     for (const ref of table.referencedBy) {
       const childTable = metadata.tables.get(`${ref.referencedSchema}.${ref.referencedTable}`);
       if (!childTable || !childTable.primaryKey) continue;
+      if (childTable.relKind !== 'table') continue;
 
-      const pkCol = table.primaryKey?.columns[0] || 'id';
       const parentParam = `${table.name}Id`;
       const nestedBase = `/${table.name}/:${parentParam}/${childTable.name}`;
-
       const fkCol = ref.referencedColumns[0];
 
       router.get(
         nestedBase,
+        createPermissionCheck(childTable, this.metadataStore, 'select'),
         this.asyncHandler(createListHandler(
           childTable,
           this.pool,
@@ -87,6 +112,7 @@ export class DynamicRouter {
 
       router.get(
         `${nestedBase}/:id`,
+        createPermissionCheck(childTable, this.metadataStore, 'select'),
         this.asyncHandler(createDetailHandler(
           childTable,
           this.pool,
@@ -98,10 +124,12 @@ export class DynamicRouter {
 
       router.post(
         nestedBase,
+        createPermissionCheck(childTable, this.metadataStore, 'insert'),
         this.asyncHandler(createCreateHandler(
           childTable,
           this.pool,
           this.metadataStore,
+          this.config,
           { column: fkCol, paramName: parentParam },
         )),
       );

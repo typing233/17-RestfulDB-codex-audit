@@ -1,9 +1,23 @@
 export const TABLES_QUERY = `
-SELECT table_schema, table_name
+SELECT table_schema, table_name, 'table' AS rel_kind
 FROM information_schema.tables
 WHERE table_schema = ANY($1)
   AND table_type = 'BASE TABLE'
 ORDER BY table_schema, table_name;
+`;
+
+export const VIEWS_QUERY = `
+SELECT table_schema, table_name, 'view' AS rel_kind
+FROM information_schema.views
+WHERE table_schema = ANY($1)
+ORDER BY table_schema, table_name;
+`;
+
+export const MATERIALIZED_VIEWS_QUERY = `
+SELECT schemaname AS table_schema, matviewname AS table_name, 'matview' AS rel_kind
+FROM pg_matviews
+WHERE schemaname = ANY($1)
+ORDER BY schemaname, matviewname;
 `;
 
 export const COLUMNS_QUERY = `
@@ -82,4 +96,29 @@ JOIN information_schema.key_column_usage kcu
 WHERE tc.table_schema = ANY($1)
   AND tc.constraint_type = 'UNIQUE'
 GROUP BY tc.table_schema, tc.table_name, tc.constraint_name;
+`;
+
+export const TABLE_PRIVILEGES_QUERY = `
+SELECT
+  table_schema,
+  table_name,
+  grantee,
+  privilege_type
+FROM information_schema.role_table_grants
+WHERE table_schema = ANY($1)
+  AND privilege_type IN ('SELECT', 'INSERT', 'UPDATE', 'DELETE')
+ORDER BY table_schema, table_name, grantee;
+`;
+
+export const COLUMN_PRIVILEGES_QUERY = `
+SELECT
+  table_schema,
+  table_name,
+  column_name,
+  grantee,
+  privilege_type
+FROM information_schema.column_privileges
+WHERE table_schema = ANY($1)
+  AND privilege_type IN ('SELECT', 'INSERT', 'UPDATE')
+ORDER BY table_schema, table_name, column_name, grantee;
 `;
